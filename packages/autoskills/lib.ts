@@ -2,7 +2,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 
-import type { Technology, ComboSkill, ConfigFileContentBlock } from "./skills-map.ts";
+import type { Technology, ComboSkill, FileContentPatternBlock } from "./skills-map.ts";
 
 export {
   SKILLS_MAP,
@@ -47,22 +47,73 @@ const SCAN_SKIP_DIRS = new Set([
   "bin",
   "obj",
   ".vs",
+  "target",
+  "out",
+  "DerivedData",
+  "Pods",
+  "venv",
+  "tox",
+  "_build",
+  "bower_components",
 ]);
 
-const GRADLE_SCAN_ROOT_FILES = [
-  "build.gradle.kts",
-  "build.gradle",
-  "settings.gradle.kts",
-  "settings.gradle",
-  "gradle/libs.versions.toml",
-];
+const GRADLE_BUILD_FILES = ["build.gradle.kts", "build.gradle"];
+const GRADLE_SETTINGS_FILES = ["settings.gradle.kts", "settings.gradle"];
 
-const DOTNET_SCAN_ROOT_FILES = [
+const ROOT_BUILD_MANIFESTS = [
+  "package.json",
+  "deno.json",
+  "deno.jsonc",
+  ...GRADLE_BUILD_FILES,
+  ...GRADLE_SETTINGS_FILES,
+  "gradle/libs.versions.toml",
+  "pom.xml",
+  "Directory.Packages.props",
+  "Directory.Build.props",
   "global.json",
   "NuGet.Config",
-  "Directory.Build.props",
-  "Directory.Packages.props",
+  "go.work",
+  "go.mod",
+  "Cargo.toml",
+  "composer.json",
+  "Gemfile",
+  "Package.swift",
 ];
+
+// Manifests whose content declares sibling members
+const MEMBER_DECLARING_MANIFESTS = [...GRADLE_SETTINGS_FILES, "pom.xml", "Cargo.toml", "go.work"];
+
+// Manifests indexed for content scanning in every discovered member
+const MEMBER_MANIFEST_NAMES = [
+  "package.json",
+  "deno.json",
+  "deno.jsonc",
+  "pyproject.toml",
+  "requirements.txt",
+  "setup.py",
+  "setup.cfg",
+  "Pipfile",
+  "composer.json",
+  "Gemfile",
+  "pom.xml",
+  "Cargo.toml",
+  "go.mod",
+  "Package.swift",
+  "Directory.Packages.props",
+  "Directory.Build.props",
+  "global.json",
+  ...GRADLE_SETTINGS_FILES,
+  ...GRADLE_BUILD_FILES,
+];
+
+// Scans deeper than the extension probes so nested sources are reachable
+const SCAN_DEPTH = 6;
+
+const DOTNET_PROJECT_EXTENSIONS = [".csproj", ".fsproj", ".vbproj", ".sln"];
+const DOTNET_PROJECT_DEPTH = 2;
+
+// Depth for dirs that carry a build manifest without being declared anywhere
+const UNDECLARED_MEMBER_DEPTH = 2;
 
 // ── Gradle Scanning ──────────────────────────────────────────
 
@@ -81,118 +132,222 @@ export function parseSettingsGradleModules(content: string): string[] {
   return modules;
 }
 
-const _gradleCache = new Map<string, string[]>();
+// ── Scan Cache ───────────────────────────────────────────────
 
-function gradleLayoutCandidatePaths(projectDir: string): string[] {
-  const cached = _gradleCache.get(projectDir);
-  if (cached) return cached;
-
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-
-  function add(filePath: string): void {
-    if (!seen.has(filePath)) {
-      candidates.push(filePath);
-      seen.add(filePath);
-    }
-  }
-
-  for (const f of GRADLE_SCAN_ROOT_FILES) {
-    add(join(projectDir, f));
-  }
-  let entries: import("node:fs").Dirent[];
-  try {
-    entries = readdirSync(projectDir, { withFileTypes: true });
-  } catch {
-    entries = [];
-  }
-  for (const e of entries) {
-    if (!e.isDirectory() || e.name.startsWith(".") || SCAN_SKIP_DIRS.has(e.name)) continue;
-    for (const g of ["build.gradle.kts", "build.gradle"]) {
-      add(join(projectDir, e.name, g));
-    }
-  }
-
-  for (const settingsFile of ["settings.gradle.kts", "settings.gradle"]) {
-    const settingsPath = join(projectDir, settingsFile);
-    let content: string;
-    try {
-      content = readFileSync(settingsPath, "utf-8");
-    } catch {
-      continue;
-    }
-    for (const modulePath of parseSettingsGradleModules(content)) {
-      for (const g of ["build.gradle.kts", "build.gradle"]) {
-        add(join(projectDir, modulePath, g));
-      }
-    }
-    break;
-  }
-
-  _gradleCache.set(projectDir, candidates);
-  return candidates;
+interface ScanCache {
+  read(filePath: string): string | null;
+  exists(filePath: string): boolean;
+  hasExtension(dir: string, extensions: string[]): boolean;
+  hasContentMatch(dir: string, query: FileContentPatternBlock): boolean;
 }
 
-// ── .NET Scanning ────────────────────────────────────────────
+function createScanCache(): ScanCache {
+  const contentByPath = new Map<string, string | null>();
+  const existsByPath = new Map<string, boolean>();
+  const extensionByKey = new Map<string, boolean>();
+  const contentMatchByKey = new Map<string, boolean>();
 
-const _dotNetCache = new Map<string, string[]>();
+  const cache: ScanCache = {
+    read(filePath: string): string | null {
+      const cachedContent = contentByPath.get(filePath);
+      if (cachedContent !== undefined) return cachedContent;
+      let fileContent: string | null = null;
+      try {
+        fileContent = readFileSync(filePath, "utf-8");
+      } catch {
+        fileContent = null;
+      }
+      contentByPath.set(filePath, fileContent);
+      if (fileContent !== null) existsByPath.set(filePath, true);
+      return fileContent;
+    },
 
-function dotNetLayoutCandidatePaths(projectDir: string): string[] {
-  const cached = _dotNetCache.get(projectDir);
-  if (cached) return cached;
+    exists(filePath: string): boolean {
+      const cachedExists = existsByPath.get(filePath);
+      if (cachedExists !== undefined) return cachedExists;
+      const found = existsSync(filePath);
+      existsByPath.set(filePath, found);
+      return found;
+    },
 
-  const candidates: string[] = [];
+    hasExtension(dir: string, extensions: string[]): boolean {
+      const key = `${dir}\0${extensions.join("\0")}`;
+      const cachedScan = extensionByKey.get(key);
+      if (cachedScan !== undefined) return cachedScan;
+      const found = hasFileWithExtension(dir, extensions, SCAN_DEPTH);
+      extensionByKey.set(key, found);
+      return found;
+    },
+
+    hasContentMatch(dir: string, query: FileContentPatternBlock): boolean {
+      const key = `${dir}\0${query.extensions.join("\0")}\0${query.patterns.join("\0")}`;
+      const cachedMatch = contentMatchByKey.get(key);
+      if (cachedMatch !== undefined) return cachedMatch;
+      const found = findFileWithContentMatch({
+        dir,
+        extensions: query.extensions,
+        patterns: query.patterns,
+        read: cache.read,
+      });
+      contentMatchByKey.set(key, found);
+      return found;
+    },
+  };
+
+  return cache;
+}
+
+// ── Declared Members ─────────────────────────────────────────
+
+function parseMavenModules(content: string): string[] {
+  const modulesBlock = content.match(/<modules>([\s\S]*?)<\/modules>/);
+  if (!modulesBlock) return [];
+  return [...modulesBlock[1].matchAll(/<module>\s*([^<]+?)\s*<\/module>/g)].map(
+    (match) => match[1],
+  );
+}
+
+function parseGoWorkspaceUses(content: string): string[] {
+  const uses: string[] = [];
+
+  for (const useBlock of content.matchAll(/use\s*\(([^)]*)\)/g)) {
+    for (const token of useBlock[1].split(/\s+/)) {
+      const usePath = token.replace(/^"|"$/g, "");
+      if (usePath) uses.push(usePath);
+    }
+  }
+
+  for (const useLine of content.matchAll(/^\s*use\s+"?([^"\s(][^\s"]*)"?\s*$/gm)) {
+    uses.push(useLine[1]);
+  }
+
+  return uses;
+}
+
+function parseCargoWorkspaceMembers(content: string): string[] {
+  const workspaceBlock = content.match(/\[workspace\]([\s\S]*?)(?:\n\s*\[|$)/);
+  const membersList = workspaceBlock?.[1].match(/members\s*=\s*\[([\s\S]*?)\]/);
+  if (!membersList) return [];
+  return membersList[1]
+    .split(",")
+    .map((entry) => entry.trim().replace(/^["']|["']$/g, ""))
+    .filter((entry) => entry.length > 0);
+}
+
+const MEMBER_DECLARING_PARSERS: Record<string, (content: string) => string[]> = {
+  "settings.gradle": parseSettingsGradleModules,
+  "settings.gradle.kts": parseSettingsGradleModules,
+  "pom.xml": parseMavenModules,
+  "go.work": parseGoWorkspaceUses,
+  "Cargo.toml": parseCargoWorkspaceMembers,
+};
+
+function resolveDeclaredMembers(projectDir: string, cache: ScanCache): string[] {
+  const rootDir = resolve(projectDir);
+  const members: string[] = [];
   const seen = new Set<string>();
 
-  function add(filePath: string): void {
-    if (!seen.has(filePath)) {
-      candidates.push(filePath);
-      seen.add(filePath);
+  for (const name of MEMBER_DECLARING_MANIFESTS) {
+    const content = cache.read(join(projectDir, name));
+    if (content === null) continue;
+    for (const declaredPath of MEMBER_DECLARING_PARSERS[name](content)) {
+      const memberDir = resolve(projectDir, declaredPath);
+      if (memberDir === rootDir || seen.has(memberDir)) continue;
+      seen.add(memberDir);
+      members.push(memberDir);
     }
   }
 
-  for (const f of DOTNET_SCAN_ROOT_FILES) {
-    add(join(projectDir, f));
-  }
+  return members;
+}
+
+// Finds dirs holding a build manifest that no workspace file declared
+function discoverUndeclaredMembers(projectDir: string, cache: ScanCache): string[] {
+  const members: string[] = [];
 
   function scan(dir: string, depth: number): void {
-    if (depth > 2) return;
-    let entries: import("node:fs").Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
-    for (const e of entries) {
-      if (e.isFile()) {
-        const lower = e.name.toLowerCase();
-        if (lower.endsWith(".sln") || lower.endsWith(".csproj") || lower.endsWith(".fsproj")) {
-          add(join(dir, e.name));
-        }
-      } else if (e.isDirectory() && !e.name.startsWith(".") && !SCAN_SKIP_DIRS.has(e.name)) {
-        scan(join(dir, e.name), depth + 1);
-      }
+    for (const entry of readDirEntries(dir)) {
+      if (!isScannableDir(entry)) continue;
+      const entryPath = join(dir, entry.name);
+      const holdsManifest = MEMBER_MANIFEST_NAMES.some((name) =>
+        cache.exists(join(entryPath, name)),
+      );
+      if (holdsManifest) members.push(entryPath);
+      else if (depth < UNDECLARED_MEMBER_DEPTH) scan(entryPath, depth + 1);
     }
   }
 
   scan(projectDir, 0);
-
-  _dotNetCache.set(projectDir, candidates);
-  return candidates;
+  return members;
 }
 
-function resolveConfigFileContentPaths(
+// ── Manifest Discovery ───────────────────────────────────────
+
+function readDirEntries(dir: string): import("node:fs").Dirent[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+function isScannableDir(entry: import("node:fs").Dirent): boolean {
+  return entry.isDirectory() && !entry.name.startsWith(".") && !SCAN_SKIP_DIRS.has(entry.name);
+}
+
+interface ManifestCandidateInput {
+  memberDirs: Set<string>;
+}
+
+function buildManifestCandidatePaths(
   projectDir: string,
-  config: ConfigFileContentBlock,
+  { memberDirs }: ManifestCandidateInput,
 ): string[] {
-  if (config.scanGradleLayout) {
-    return gradleLayoutCandidatePaths(projectDir);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (filePath: string): void => {
+    if (!seen.has(filePath)) {
+      candidates.push(filePath);
+      seen.add(filePath);
+    }
+  };
+
+  const addMemberManifests = (dir: string): void => {
+    for (const name of MEMBER_MANIFEST_NAMES) {
+      add(join(dir, name));
+    }
+  };
+
+  const addDotNetProjectFiles = (dir: string, depth: number): void => {
+    for (const entry of readDirEntries(dir)) {
+      const entryPath = join(dir, entry.name);
+      if (entry.isFile()) {
+        const lowerName = entry.name.toLowerCase();
+        if (DOTNET_PROJECT_EXTENSIONS.some((extension) => lowerName.endsWith(extension))) {
+          add(entryPath);
+        }
+      } else if (isScannableDir(entry) && depth < DOTNET_PROJECT_DEPTH) {
+        addDotNetProjectFiles(entryPath, depth + 1);
+      }
+    }
+  };
+
+  for (const name of ROOT_BUILD_MANIFESTS) {
+    add(join(projectDir, name));
   }
-  if (config.scanDotNetLayout) {
-    return dotNetLayoutCandidatePaths(projectDir);
+
+  addDotNetProjectFiles(projectDir, 0);
+
+  for (const entry of readDirEntries(projectDir)) {
+    if (isScannableDir(entry)) addMemberManifests(join(projectDir, entry.name));
   }
-  return (config.files || []).map((f) => join(projectDir, f));
+
+  for (const memberDir of memberDirs) {
+    addMemberManifests(memberDir);
+  }
+
+  return candidates;
 }
 
 // ── Project File Scanning ────────────────────────────────────
@@ -231,16 +386,44 @@ function hasFileWithExtension(
   return scan(projectDir, 0);
 }
 
+interface ContentMatchScan {
+  dir: string;
+  extensions: string[];
+  patterns: string[];
+  read: (filePath: string) => string | null;
+}
+
+function findFileWithContentMatch(scan: ContentMatchScan, depth: number = 0): boolean {
+  const extensions = new Set(
+    scan.extensions.map((extension) =>
+      (extension.startsWith(".") ? extension : `.${extension}`).toLowerCase(),
+    ),
+  );
+  const patterns = scan.patterns.map((pattern) => pattern.toLowerCase());
+
+  for (const entry of readDirEntries(scan.dir)) {
+    const entryPath = join(scan.dir, entry.name);
+    if (entry.isFile()) {
+      const lowerName = entry.name.toLowerCase();
+      const extensionMatched = [...extensions].some((extension) => lowerName.endsWith(extension));
+      if (!extensionMatched) continue;
+      const fileContent = scan.read(entryPath);
+      if (fileContent === null) continue;
+      const lowerContent = fileContent.toLowerCase();
+      if (patterns.some((pattern) => lowerContent.includes(pattern))) return true;
+    } else if (isScannableDir(entry) && depth < SCAN_DEPTH) {
+      if (findFileWithContentMatch({ ...scan, dir: entryPath }, depth + 1)) return true;
+    }
+  }
+
+  return false;
+}
+
 // ── Frontend File Scanning ───────────────────────────────────
 
-export function hasWebFrontendFiles(projectDir: string, maxDepth: number = 3): boolean {
+export function hasWebFrontendFiles(projectDir: string, maxDepth: number = SCAN_DEPTH): boolean {
   function scan(dir: string, depth: number): boolean {
-    let entries: import("node:fs").Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
+    const entries = readDirEntries(dir);
 
     for (const entry of entries) {
       if (entry.isFile()) {
@@ -440,6 +623,8 @@ export function getAllPackageNames(pkg: Record<string, unknown> | null): string[
 }
 
 interface DetectInDirOptions {
+  cache: ScanCache;
+  manifestPaths: string[];
   skipFrontendFiles?: boolean;
   pkg?: Record<string, unknown> | null;
   denoJson?: Record<string, unknown> | null;
@@ -454,10 +639,12 @@ interface DetectInDirResult {
 function detectTechnologiesInDir(
   dir: string,
   {
+    cache,
+    manifestPaths,
     skipFrontendFiles = false,
     pkg: preloadedPkg,
     denoJson: preloadedDeno,
-  }: DetectInDirOptions = {},
+  }: DetectInDirOptions,
 ): DetectInDirResult {
   const pkg = preloadedPkg !== undefined ? preloadedPkg : readPackageJson(dir);
   const allPackages = getAllPackageNames(pkg);
@@ -468,27 +655,6 @@ function detectTechnologiesInDir(
   const allDepsArray = denoImports.length > 0 ? [...allDepsSet] : allPackages;
   let gemNames: string[] | undefined;
   const detected: Technology[] = [];
-  const fileContentCache = new Map<string, string | null>();
-  const existsCache = new Map<string, boolean>();
-  const fileExtensionCache = new Map<string, boolean>();
-
-  function cachedRead(filePath: string): string | null {
-    if (fileContentCache.has(filePath)) return fileContentCache.get(filePath)!;
-    let content: string | null = null;
-    try {
-      content = readFileSync(filePath, "utf-8");
-    } catch {}
-    fileContentCache.set(filePath, content);
-    if (content !== null) existsCache.set(filePath, true);
-    return content;
-  }
-
-  function cachedExists(filePath: string): boolean {
-    if (existsCache.has(filePath)) return existsCache.get(filePath)!;
-    const result = existsSync(filePath);
-    existsCache.set(filePath, result);
-    return result;
-  }
 
   for (const tech of SKILLS_MAP) {
     let found = false;
@@ -504,15 +670,15 @@ function detectTechnologiesInDir(
     }
 
     if (!found && tech.detect.configFiles) {
-      found = tech.detect.configFiles.some((f) => cachedExists(join(dir, f)));
+      found = tech.detect.configFiles.some((f) => cache.exists(join(dir, f)));
     }
 
     if (!found && tech.detect.fileExtensions) {
-      const key = tech.detect.fileExtensions.join("\0");
-      if (!fileExtensionCache.has(key)) {
-        fileExtensionCache.set(key, hasFileWithExtension(dir, tech.detect.fileExtensions));
-      }
-      found = fileExtensionCache.get(key)!;
+      found = cache.hasExtension(dir, tech.detect.fileExtensions);
+    }
+
+    if (!found && tech.detect.fileContentPatterns) {
+      found = tech.detect.fileContentPatterns.some((query) => cache.hasContentMatch(dir, query));
     }
 
     if (!found && tech.detect.gems) {
@@ -525,16 +691,10 @@ function detectTechnologiesInDir(
         ? tech.detect.configFileContent
         : [tech.detect.configFileContent];
       for (const cfg of configs) {
-        const paths = resolveConfigFileContentPaths(dir, cfg);
-        const { patterns } = cfg;
-        for (const filePath of paths) {
-          const content = cachedRead(filePath);
-          if (content === null) continue;
-          if (patterns.some((p) => content.includes(p))) {
-            found = true;
-            break;
-          }
-        }
+        const blockFiles = cfg.files?.map((fileName) => join(dir, fileName)) ?? manifestPaths;
+        found = cfg.patterns.some((pattern) =>
+          blockFiles.some((filePath) => cache.read(filePath)?.includes(pattern)),
+        );
         if (found) break;
       }
     }
@@ -558,29 +718,41 @@ export interface DetectResult {
 }
 
 export function detectTechnologies(projectDir: string): DetectResult {
+  const cache = createScanCache();
   const pkg = readPackageJson(projectDir);
   const denoJson = readDenoJson(projectDir);
-  const root = detectTechnologiesInDir(projectDir, { pkg, denoJson });
-  const seenIds = new Map<string, Technology>(root.detected.map((t) => [t.id, t]));
+
+  const memberDirs = new Set([
+    ...resolveWorkspaces(projectDir, { pkg, denoJson }),
+    ...resolveDeclaredMembers(projectDir, cache),
+    ...discoverUndeclaredMembers(projectDir, cache),
+  ]);
+
+  const manifestPaths = buildManifestCandidatePaths(projectDir, { memberDirs });
+  const root = detectTechnologiesInDir(projectDir, { cache, manifestPaths, pkg, denoJson });
+  const seenIds = new Map<string, Technology>(root.detected.map((tech) => [tech.id, tech]));
   let isFrontend = root.isFrontendByPackages || root.isFrontendByFiles;
 
-  const workspaceDirs = resolveWorkspaces(projectDir, { pkg, denoJson });
-  for (const wsDir of workspaceDirs) {
-    const ws = detectTechnologiesInDir(wsDir, { skipFrontendFiles: isFrontend });
+  for (const memberDir of memberDirs) {
+    const member = detectTechnologiesInDir(memberDir, {
+      cache,
+      manifestPaths,
+      skipFrontendFiles: isFrontend,
+    });
 
-    for (const tech of ws.detected) {
+    for (const tech of member.detected) {
       if (!seenIds.has(tech.id)) {
         seenIds.set(tech.id, tech);
       }
     }
 
-    if (ws.isFrontendByPackages || ws.isFrontendByFiles) {
+    if (member.isFrontendByPackages || member.isFrontendByFiles) {
       isFrontend = true;
     }
   }
 
   const detected = [...seenIds.values()];
-  const detectedIds = detected.map((t) => t.id);
+  const detectedIds = detected.map((tech) => tech.id);
   const combos = detectCombos(detectedIds);
 
   return { detected, isFrontend, combos };

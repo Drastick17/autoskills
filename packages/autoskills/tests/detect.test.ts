@@ -1519,7 +1519,199 @@ describe("detectTechnologies (monorepo)", () => {
     const { detected } = detectTechnologies(tmp.path);
     ok(detected.some((t) => t.id === "cloudflare-durable-objects"));
   });
+
+  it("detects technologies from Gradle declared members", () => {
+    writeFile(tmp.path, "settings.gradle.kts", 'include(":api")\ninclude(":web")');
+    writeFile(tmp.path, "api/build.gradle.kts", 'plugins { id("com.android.application") }');
+    writeFile(tmp.path, "web/build.gradle.kts", 'plugins { id("kotlin-multiplatform") }');
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("android"), "first declared member should be scanned");
+    ok(ids.includes("kotlin-multiplatform"), "second declared member should be scanned");
+  });
+
+  it("scopes a declared member to its own declared files", () => {
+    writeFile(tmp.path, "settings.gradle.kts", 'include(":api")');
+    writeFile(
+      tmp.path,
+      "api/build.gradle.kts",
+      'dependencies { implementation("org.springframework.boot:spring-boot-starter-web:3.4.0") }',
+    );
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(!ids.includes("springboot"), "springboot is scoped to pom.xml, not build.gradle.kts");
+  });
+
+  it("detects technologies from Maven declared modules", () => {
+    writeFile(
+      tmp.path,
+      "pom.xml",
+      "<project><modules><module>service</module></modules></project>",
+    );
+    writeFile(
+      tmp.path,
+      "service/pom.xml",
+      "<project><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId><version>3.4.0</version></dependency></project>",
+    );
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("springboot"), "declared Maven module should be scanned");
+  });
+
+  it("detects technologies from go.work declared members", () => {
+    writeFile(tmp.path, "go.work", "go 1.22\n\nuse (\n\t./api\n\t./worker\n)");
+    writeFile(tmp.path, "api/go.mod", "module api\n\ngo 1.22\n");
+    writeFile(
+      tmp.path,
+      "worker/go.mod",
+      "module worker\n\ngo 1.22\n\nrequire github.com/redis/go-redis/v9 v9.5.0\n",
+    );
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("go"), "go.work member should be scanned");
+  });
+
+  it("detects technologies from Cargo declared members", () => {
+    writeFile(tmp.path, "Cargo.toml", '[workspace]\nmembers = ["crates/core"]');
+    writeFile(tmp.path, "crates/core/Cargo.toml", '[package]\nname = "core"\nversion = "0.1.0"');
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("rust"), "workspace and declared member manifests should be scanned");
+  });
+
+  it("ignores build output directories when discovering members", () => {
+    writeFile(tmp.path, "package.json", JSON.stringify({ workspaces: ["apps/*"] }));
+    writeJson(tmp.path, "apps/web/package.json", { dependencies: { next: "^15" } });
+    writeJson(tmp.path, "node_modules/react/package.json", { dependencies: { vue: "^3" } });
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("nextjs"));
+    ok(!ids.includes("vue"), "node_modules should be skipped");
+  });
+
+  it("detects Go backend and React frontend when go.work omits the web member", () => {
+    writeFile(tmp.path, "go.work", "go 1.24.0\n\nuse (\n\t./api\n)\n");
+    writeFile(tmp.path, "api/go.mod", "module api\n\ngo 1.24.0\n");
+    writeJson(tmp.path, "web/package.json", {
+      dependencies: { react: "^19.0.0" },
+      devDependencies: { vite: "^6.0.0" },
+    });
+    const detected = detectTechnologies(tmp.path);
+    const ids = detected.detected.map((t) => t.id);
+    ok(ids.includes("go"), "Go backend should be detected");
+    ok(ids.includes("react"), "undeclared web member should be scanned");
+    ok(ids.includes("vite"), "undeclared web member build tool should be detected");
+    ok(detected.isFrontend);
+  });
+
+  it("detects sibling stacks with no workspace file at all", () => {
+    writeFile(tmp.path, "api/go.mod", "module api\n\ngo 1.24.0\n");
+    writeJson(tmp.path, "web/package.json", {
+      dependencies: { react: "^19.0.0" },
+      devDependencies: { typescript: "^5.7.0" },
+    });
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("go"), "Go backend should be detected");
+    ok(ids.includes("react"), "sibling web member should be scanned");
+    ok(ids.includes("typescript"));
+  });
+
+  it("detects stacks nested two levels deep without declarations", () => {
+    writeFile(tmp.path, "services/api/go.mod", "module api\n\ngo 1.24.0\n");
+    writeJson(tmp.path, "apps/web/package.json", { dependencies: { react: "^19.0.0" } });
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("go"), "nested Go backend should be detected");
+    ok(ids.includes("react"), "nested web member should be scanned");
+  });
+
+  it("detects a Python backend and an undeclared web member together", () => {
+    writeFile(tmp.path, "pyproject.toml", '[project]\ndependencies = ["fastapi>=0.115"]\n');
+    writeJson(tmp.path, "web/package.json", { dependencies: { react: "^19.0.0" } });
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("python"), "Python backend should be detected");
+    ok(ids.includes("fastapi"));
+    ok(ids.includes("react"), "undeclared web member should be scanned");
+  });
 });
+
+// ── detectTechnologies (configFileContent file scoping) ───────
+
+describe("detectTechnologies (configFileContent file scoping)", () => {
+  const tmp = useTmpDir();
+
+  it("does not detect requests from a non-Python manifest", () => {
+    writeFile(tmp.path, "package.json", JSON.stringify({ dependencies: { requests: "^2.0.0" } }));
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(!ids.includes("requests"), "requests must stay scoped to Python manifests");
+  });
+
+  it("does not detect requests from a member manifest", () => {
+    writeJson(tmp.path, "services/api/package.json", { dependencies: { requests: "^2.0.0" } });
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(!ids.includes("requests"), "member manifests must not widen a scoped block");
+  });
+
+  it("still detects requests from requirements.txt", () => {
+    writeFile(tmp.path, "requirements.txt", "requests>=2.31.0\n");
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("requests"));
+  });
+
+  it("does not detect flutter outside pubspec.yaml", () => {
+    writeFile(tmp.path, "Cargo.toml", '[package]\nname = "app"\ndescription = "flutter: mobile"');
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(!ids.includes("flutter"), "flutter must stay scoped to pubspec.yaml");
+  });
+
+  it("does not detect chrome-extension from a non-manifest.json", () => {
+    writeFile(tmp.path, "package.json", JSON.stringify({ manifest_version: 3 }));
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(!ids.includes("chrome-extension"), "manifest_version must stay scoped to manifest.json");
+  });
+
+  it("scans shared manifests for blocks that declare no files", () => {
+    writeFile(
+      tmp.path,
+      "api/build.gradle.kts",
+      'plugins { id("org.jetbrains.kotlin.multiplatform") }',
+    );
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(
+      ids.includes("kotlin-multiplatform"),
+      "blocks without files must still read member manifests",
+    );
+  });
+});
+
+// ── detectTechnologies (Tailwind content patterns) ────────────
+
+describe("detectTechnologies (Tailwind content patterns)", () => {
+  const tmp = useTmpDir();
+
+  it("detects Tailwind from CDN script tag", () => {
+    writeFile(
+      tmp.path,
+      "src/main/resources/templates/index.html",
+      '<script src="https://cdn.tailwindcss.com"></script>',
+    );
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("tailwind"));
+  });
+
+  it("detects Tailwind from CSS import", () => {
+    writeFile(tmp.path, "src/styles/app.css", '@import "tailwindcss";');
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("tailwind"));
+  });
+
+  it("detects Tailwind from CSS directives", () => {
+    writeFile(tmp.path, "static/css/main.css", "@tailwind base;\n@tailwind utilities;");
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(ids.includes("tailwind"));
+  });
+
+  it("does not detect Tailwind from unrelated HTML", () => {
+    writeFile(tmp.path, "index.html", "<h1>hello</h1>");
+    const ids = detectTechnologies(tmp.path).detected.map((t) => t.id);
+    ok(!ids.includes("tailwind"));
+  });
+});
+
+// ── detectTechnologies (version conflicts) ────────────────────
 
 // ── detectCombos ──────────────────────────────────────────────
 

@@ -3,8 +3,11 @@
 export interface ConfigFileContentBlock {
   files?: string[];
   patterns: string[];
-  scanGradleLayout?: boolean;
-  scanDotNetLayout?: boolean;
+}
+
+export interface FileContentPatternBlock {
+  extensions: string[];
+  patterns: string[];
 }
 
 export interface DetectConfig {
@@ -14,6 +17,7 @@ export interface DetectConfig {
   fileExtensions?: string[];
   gems?: string[];
   configFileContent?: ConfigFileContentBlock | ConfigFileContentBlock[];
+  fileContentPatterns?: FileContentPatternBlock[];
 }
 
 export interface Technology {
@@ -129,6 +133,21 @@ export const SKILLS_MAP: Technology[] = [
     detect: {
       packages: ["tailwindcss", "@tailwindcss/vite"],
       configFiles: ["tailwind.config.js", "tailwind.config.ts", "tailwind.config.cjs"],
+      fileContentPatterns: [
+        {
+          extensions: [".html", ".htm", ".php", ".blade.php"],
+          patterns: ["cdn.tailwindcss.com", "cdn.jsdelivr.net/npm/@tailwindcss/browser"],
+        },
+        {
+          extensions: [".css", ".scss", ".sass", ".less"],
+          patterns: [
+            "@tailwind",
+            '@import "tailwindcss"',
+            "@import 'tailwindcss'",
+            '@use "tailwindcss"',
+          ],
+        },
+      ],
     },
     skills: ["giuseppe-trisciuoglio/developer-kit/tailwind-css-patterns"],
   },
@@ -259,7 +278,6 @@ export const SKILLS_MAP: Technology[] = [
     name: "Kotlin Multiplatform",
     detect: {
       configFileContent: {
-        scanGradleLayout: true,
         patterns: [
           'kotlin("multiplatform")',
           "org.jetbrains.kotlin.multiplatform",
@@ -278,7 +296,6 @@ export const SKILLS_MAP: Technology[] = [
     name: "Android",
     detect: {
       configFileContent: {
-        scanGradleLayout: true,
         patterns: [
           "com.android.application",
           "com.android.library",
@@ -360,7 +377,6 @@ export const SKILLS_MAP: Technology[] = [
           patterns: ["clerk/clerk-ios", "ClerkSDK"],
         },
         {
-          scanGradleLayout: true,
           patterns: ["com.clerk"],
         },
       ],
@@ -680,7 +696,6 @@ export const SKILLS_MAP: Technology[] = [
     detect: {
       configFiles: ["pom.xml"],
       configFileContent: {
-        scanGradleLayout: true,
         patterns: [
           "sourceCompatibility",
           "targetCompatibility",
@@ -808,7 +823,6 @@ export const SKILLS_MAP: Technology[] = [
         "Directory.Packages.props",
       ],
       configFileContent: {
-        scanDotNetLayout: true,
         patterns: ['<Project Sdk="Microsoft.NET.Sdk'],
       },
     },
@@ -823,7 +837,6 @@ export const SKILLS_MAP: Technology[] = [
     name: "C#",
     detect: {
       configFileContent: {
-        scanDotNetLayout: true,
         patterns: ["<Project", "Microsoft.NET.Sdk"],
       },
     },
@@ -842,7 +855,6 @@ export const SKILLS_MAP: Technology[] = [
     detect: {
       configFiles: ["appsettings.json", "appsettings.Development.json"],
       configFileContent: {
-        scanDotNetLayout: true,
         patterns: ["Microsoft.NET.Sdk.Web"],
       },
     },
@@ -853,7 +865,6 @@ export const SKILLS_MAP: Technology[] = [
     name: "Blazor",
     detect: {
       configFileContent: {
-        scanDotNetLayout: true,
         patterns: ["Microsoft.NET.Sdk.BlazorWebAssembly", "Microsoft.AspNetCore.Components"],
       },
     },
@@ -865,7 +876,6 @@ export const SKILLS_MAP: Technology[] = [
     detect: {
       configFiles: ["appsettings.json"],
       configFileContent: {
-        scanDotNetLayout: true,
         patterns: ["Microsoft.AspNetCore.OpenApi", "Swashbuckle.AspNetCore"],
       },
     },
@@ -924,14 +934,6 @@ export const SKILLS_MAP: Technology[] = [
     skills: [],
   },
   {
-    id: "python",
-    name: "Python",
-    detect: {
-      configFiles: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"],
-    },
-    skills: [],
-  },
-  {
     id: "sorbet",
     name: "Sorbet",
     detect: {
@@ -952,33 +954,10 @@ export const SKILLS_MAP: Technology[] = [
     skills: [],
   },
   {
-    id: "django",
-    name: "Django",
-    detect: {
-      configFiles: ["manage.py"],
-      configFileContent: {
-        files: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"],
-        patterns: ["django", "Django"],
-      },
-    },
-    skills: [],
-  },
-  {
     id: "devise",
     name: "Devise",
     detect: {
       gems: ["devise"],
-    },
-    skills: [],
-  },
-  {
-    id: "fastapi",
-    name: "FastAPI",
-    detect: {
-      configFileContent: {
-        files: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"],
-        patterns: ["fastapi", "FastAPI"],
-      },
     },
     skills: [],
   },
@@ -1039,7 +1018,7 @@ export const SKILLS_MAP: Technology[] = [
     id: "python",
     name: "Python",
     detect: {
-      configFiles: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"],
+      configFiles: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"],
     },
     skills: ["inferen-sh/skills/python-executor", "wshobson/agents/python-testing-patterns"],
   },
@@ -1048,7 +1027,7 @@ export const SKILLS_MAP: Technology[] = [
     name: "FastAPI",
     detect: {
       configFileContent: {
-        files: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"],
+        files: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"],
         patterns: ["fastapi", "FastAPI"],
       },
     },
@@ -1069,8 +1048,9 @@ export const SKILLS_MAP: Technology[] = [
     id: "django",
     name: "Django",
     detect: {
+      configFiles: ["manage.py"],
       configFileContent: {
-        files: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"],
+        files: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"],
         patterns: ["django", "Django"],
       },
     },
@@ -1201,6 +1181,15 @@ export const COMBO_SKILLS_MAP: ComboSkill[] = [
     name: "Expo + Tailwind CSS",
     requires: ["expo", "tailwind"],
     skills: ["expo/skills/expo-tailwind-setup"],
+  },
+  {
+    id: "springboot-tailwind",
+    name: "Spring Boot + Tailwind CSS",
+    requires: ["springboot", "tailwind"],
+    skills: [
+      "giuseppe-trisciuoglio/developer-kit/tailwind-css-patterns",
+      "addyosmani/web-quality-skills/accessibility",
+    ],
   },
   {
     id: "react-hook-form-zod",
